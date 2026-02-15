@@ -1,6 +1,8 @@
 """BreakCheck core engine: AST-based Python API surface extraction & diff."""
 import ast
 from pathlib import Path
+from surface import discover_public_api
+
 
 LEVEL_RANK = {"patch": 0, "minor": 1, "major": 2}
 
@@ -12,11 +14,13 @@ def extract_api(source_dir):
         mod = py_file.relative_to(source_dir).with_suffix("").as_posix().replace("/", ".")
         try:
             tree = ast.parse(py_file.read_text(encoding="utf-8"))
-        except SyntaxError:
-            continue
+        public_names = discover_public_api(tree, str(py_file))
         for node in ast.iter_child_nodes(tree):
-            if isinstance(node, ast.FunctionDef) and not node.name.startswith("_"):
+            if isinstance(node, ast.FunctionDef) and node.name in public_names:
                 surface["functions"][f"{mod}.{node.name}"] = _parse_fn(node)
+            elif isinstance(node, ast.ClassDef) and node.name in public_names:
+                surface["classes"][f"{mod}.{node.name}"] = _parse_cls(node)
+
             elif isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
                 surface["classes"][f"{mod}.{node.name}"] = _parse_cls(node)
     return surface

@@ -1,8 +1,12 @@
-"""Tests for BreakCheck — 9 test cases covering core detection & gate logic."""
+"""Tests for BreakCheck — core detection, gate logic, and public API surface discovery."""
+
 import tempfile
 from pathlib import Path
 from typer.testing import CliRunner
-from breakcheck import app
+from analyzer import extract_api, diff_api, max_level
+from surface import discover_public_api
+import ast
+
 from analyzer import extract_api, diff_api, max_level
 
 runner = CliRunner()
@@ -91,3 +95,110 @@ def test_return_type_changed_is_major():
         changes = diff_api(extract_api(Path(old)), extract_api(Path(new)))
         assert any(c["kind"] == "return_type_changed" and c["level"] == "major" for c in changes)
         assert max_level(changes) == "major"
+
+
+# ============================================================
+# Public API surface discovery tests
+# ============================================================
+
+def test_dunder_all_filters_non_public():
+    """Deleting a function NOT in __all__ must NOT be reported as breaking."""
+    with tempfile.TemporaryDirectory() as old, tempfile.TemporaryDirectory() as new:
+        _make(old, "api.py", (
+            "__all__ = ['Foo']\n"
+            "def Foo() -> str:\n    return 'foo'\n"
+            "def Bar() -> str:\n    return 'bar'\n"
+        ))
+        _make(new, "api.py", (
+            "__all__ = ['Foo']\n"
+            "def Foo() -> str:\n    return 'foo'\n"
+        ))
+        changes = diff_api(extract_api(Path(old)), extract_api(Path(new)))
+        assert not any(c["kind"] == "function_removed" for c in changes)
+
+
+def test_private_func_change_not_breaking():
+    """Changing _private_func signature must not be reported."""
+    with tempfile.TemporaryDirectory() as old, tempfile.TemporaryDirectory() as new:
+        _make(old, "api.py", (
+            "def public_fn() -> str:\n    return 'ok'\n"
+            "def _private_fn(x: int) -> str:\n    return str(x)\n"
+        ))
+        _make(new, "api.py", (
+            "def public_fn() -> str:\n    return 'ok'\n"
+            "def _private_fn(x: str, y: int) -> str:\n    return x\n"
+        ))
+        changes = diff_api(extract_api(Path(old)), extract_api(Path(new)))
+        assert not any('_private_fn' in c.get("symbol", "") for c in changes)
+
+
+def test_breakcheck_ignore_skips_symbol():
+    """Symbol marked with # breakcheck: ignore must not trigger changes."""
+    with tempfile.TemporaryDirectory() as old, tempfile.TemporaryDirectory() as new:
+        _make(old, "api.py", (
+            "def stable() -> str:\n    return 'ok'\n"
+            "def experimental(x: int) -> str:  # breakcheck: ignore\n    return str(x)\n"
+        ))
+        _make(new, "api.py", (
+            "def stable() -> str:\n    return 'ok'\n"
+        ))
+        changes = diff_api(extract_api(Path(old)), extract_api(Path(new)))
+        assert not any('experimental' in c.get("symbol", "") for c in changes)
+
+
+def test_breakcheck_public_forces_inclusion():
+    """_ prefixed name with # breakcheck: public must be treated as public API."""
+    with tempfile.TemporaryDirectory() as old, tempfile.TemporaryDirectory() as new:
+        _make(old, "api.py", (
+            "def _special(x: int) -> str:  # breakcheck: public\n    return str(x)\n"
+        ))
+        _make(new, "api.py", (
+            "def _special(x: str) -> str:  # breakcheck: public\n    return x\n"
+        ))
+        changes = diff_api(extract_api(Path(old)), extract_api(Path(new)))
+        assert any(c["level"] == "major" and '_special' in c.get("symbol", "") for c in changes)
+
+
+def test_init_reexport_detected():
+    """from .sub import Foo in __init__.py must make Foo part of public API."""
+    with tempfile.TemporaryDirectory() as d:
+        pkg = Path(d) / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("from .sub import Foo\nfrom .sub import Bar\n")
+        (pkg / "sub.py").write_text("class Foo:\n    pass\nclass Bar:\n    pass\n")
+        tree = ast.parse((pkg / "__init__.py").read_text())
+        public = discover_public_api(tree, str(pkg / "__init__.py"))
+        assert "Foo" in public
+        assert "Bar" in public
+
+
+def test_dunder_all_removal_is_breaking():
+    """Function listed in __all__ that gets removed IS a breaking change."""
+    with tempfile.TemporaryDirectory() as old, tempfile.TemporaryDirectory() as new:
+        _make(old, "api.py", (
+            "__all__ = ['create', 'delete']\n"
+            "def create() -> None:\n    pass\n"
+            "def delete() -> None:\n    pass\n"
+        ))
+        _make(new, "api.py", (
+            "__all__ = ['create']\n"
+            "def create() -> None:\n    pass\n"
+        ))
+        changes = diff_api(extract_api(Path(old)), extract_api(Path(new)))
+        assert any(c["level"] == "major" and c["kind"] == "function_removed" for c in changes)
+
+
+def test_breakcheck_ignore_overrides_dunder_all():
+    """# breakcheck: ignore must override __all__ inclusion."""
+    with tempfile.TemporaryDirectory() as old, tempfile.TemporaryDirectory() as new:
+        _make(old, "api.py", (
+            "__all__ = ['stable', 'experimental']\n"
+            "def stable() -> str:\n    return 'ok'\n"
+            "def experimental(x: int) -> str:  # breakcheck: ignore\n    return str(x)\n"
+        ))
+        _make(new, "api.py", (
+            "__all__ = ['stable']\n"
+            "def stable() -> str:\n    return 'ok'\n"
+        ))
+        changes = diff_api(extract_api(Path(old)), extract_api(Path(new)))
+        assert not any('experimental' in c.get("symbol", "") for c in changes)
